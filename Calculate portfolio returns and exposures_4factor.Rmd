@@ -1,0 +1,598 @@
+---
+title: "Calculating stock weights"
+author: "Kobus Viljoen"
+date: "29 September 2016"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(
+  eval = FALSE)
+```
+
+##Necessary packages
+```{r}
+library(broom)
+library(modelr)
+library(ggplot2)
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(lubridate)
+library(tibble)
+library(plyr)
+#library(FRAPO)
+```
+
+```{r}
+
+p1 <- cross_sec_Fund_data_4Factor$stocks[[59]] %>% ggplot() + geom_bar(aes(GICS.Sector,fill = GICS.Sector),show.legend = F) + theme(aspect.ratio=1) + coord_polar()
+p2 <-cross_sec_Fund_data_4Factor$stocks[[59]] %>% ggplot() + geom_bar(aes(GICS.Sector,fill = GICS.Sector),show.legend = F) + theme(aspect.ratio=1) + coord_flip()
+grid.arrange(p1,p2,ncol=2)
+```
+
+In this file I want to calculate the weights assigned to each stock that is selected by the corresponding fundamental factor.
+I'm going to use the risk parity approach.
+At the end of the stock selection process, I'm left with a tibble with the corresponding quarterly rebalancing dates in a vector and then a list of tibbles with the selected stocks corresponding to the dates.
+
+## Merging the selected stocks with their daily log returns
+```{r}
+# close_price row number five consist out of the daily closing prices
+# log returns are calculated using this function
+log_returns <- function(df){
+close <- df$"PX_LAST"
+date <- dplyr::filter(df,date>date[1]) %>% select(date)
+ret <- tibble(date = date$date, log_ret = diff(log(close)))
+}
+
+# nesting the daily prices for each stock.
+logreturns <- close_prices$data[[5]] %>%
+  bind_rows(.id = "Ticker") %>%
+  group_by(Ticker) %>%
+  nest() %>%
+  mutate(logret = map(data,log_returns))  # Mapping the log returns function over each stock's daily close prices
+
+
+## This function takes the stocks list and dates from a specific model into account in collecting the daily return data for each selected stock for the past year.
+# The reason for doing this, is to calculate the risk parity weights, calculating variance/covariance matrix.
+Returns <- function(df1,df2){
+  Tickers <- df1 %>% select(Ticker)
+  logreturns %>%
+    unnest(logret) %>%
+    group_by(Ticker) %>%
+    filter(Ticker %in% Tickers$Ticker) %>%
+    filter(date <= df2,date >= df2 - years(2)) %>%
+    nest() %>%
+    left_join(df1,by = "Ticker")
+}
+## Example for the Momentum model
+# This will be done for each model
+Closing <- cross_sec_Fund_data_4Factor %>% 
+  mutate(returns = map2(stocks,date,Returns))
+
+# Remove the stocks with less than 500 days of data points
+# add a column to each returns tibble, which will show the number of rows for a specific share
+complete_data <- function(df){
+  extension <- df %>% mutate(size = map_dbl(df$data,NROW))
+  filter(extension,size >= max(size)-5) %>%
+    select(Ticker,data,Market.Cap)
+}
+
+Closing <- Closing %>% mutate(returns = map(returns,complete_data))
+
+## Creating a matrix with all the returns for the selected stocks.
+Return_Matrix <- function(df){
+  joined_data <- df$data %>%
+  join_all(by = "date") # Comes from the plyr package
+  colnames(joined_data) <- c("date",df$Ticker)
+  joined_data
+}
+
+Closing <- Closing %>% 
+  mutate(ret_matrix = map(returns,Return_Matrix))
+
+## Return matrix for the use of the equal risk contribution methodology.
+ERC_WEIGHTS <- function(df){
+  cov_matrix <- df[,2:length(colnames(df))] %>%
+    cov(use = "complete.obs")
+  ERC_weights <- FRAPO::PERC(Sigma = cov_matrix,percentage = FALSE)
+  ERC_weights <- as.data.frame(FRAPO::Weights(object = ERC_weights))
+  ERC_weights <- tibble(Ticker = c(rownames(ERC_weights)),ERC_Weight = ERC_weights$`FRAPO::Weights(object = ERC_weights)`)
+}
+Portf_Weights <- Closing %>% 
+  mutate(ERCWeights = map(ret_matrix,ERC_WEIGHTS)) %>%
+  select(date,ERCWeights)
+```
+
+## Market Cap weights for the volatility model
+```{r}
+MC_weights <- Closing %>% mutate(MC_Weight = map(returns,function(df){
+  df %>%
+    mutate(MC_Weight = Market.Cap/sum(Market.Cap)) %>%
+    select(c(Ticker,MC_Weight))
+}))
+
+MC_weights <- MC_weights %>% select(date,MC_Weight)
+```
+
+
+## Risk parity weights
+```{r}
+# The Portfolio Analytics package is used in order to do the optimisation to estimate the risk parity weights. The risk proxy used is the expected shortfall
+# Further investigation will be put into the risk proxy
+#install.packages("DEoptim")
+#install.packages("ROI")
+#install.packages("timeSeries")
+#install_github("R-Finance/PortfolioAnalytics")
+#install_github("cran/ROI.plugin.glpk")
+#install_github("cran/ROI.plugin.quadprog")
+library(devtools)
+library(DEoptim)
+library(ROI)
+library(PortfolioAnalytics)
+require(ROI.plugin.glpk)
+require(ROI.plugin.quadprog)
+
+# This function runs the optimization in order to estimate the risp parity weights, given an xts object.
+RP_Weights <- function(df){
+returns <- df
+rownames(returns) <- returns[[1]]
+returns <- as.xts(returns[,2:length(colnames(returns))])
+stock_names <- colnames(returns)
+pspec <- portfolio.spec(assets = stock_names)
+pspec <- add.constraint(portfolio = pspec,
+                        type = "weight_sum",
+                        min_sum = 1,
+                        max_sum =1)
+pspec <- add.constraint(portfolio = pspec,
+                        type = "box",
+                        min = 0.001,
+                        max = 0.15)
+pspec <- add.objective(portfolio =  pspec ,
+                       type= "risk_budget",
+                       name = "StdDev",
+                       min_concentration = TRUE)
+opt <- optimize.portfolio(returns,
+                          pspec,
+                          optimize_method = "ROI")
+RP_weights <- opt$weights
+}
+# Mapping the optimization function over all the periods
+Closing <- Closing %>% mutate(RP_weights = map(ret_matrix,RP_Weights))
+
+# The weights need to be merged with the returns list of tibbles.
+# This is done for the risk parity weights
+stock_weights <- function(df1,df2){
+  df2 %>% 
+    left_join(df1 %>% 
+                tibble(Ticker = c(Ticker = df2$Ticker),RP_Weight = .),by = "Ticker")
+}
+
+## adding the RP, MC and ERC weights 
+Closing <- Closing %>% 
+  mutate(returns = map2(RP_weights,returns,stock_weights)) %>%
+  mutate(returns = map2(returns,MC_weights$MC_Weight,left_join)) %>%
+  mutate(returns = map2(returns,Portf_Weights$ERCWeights,left_join))
+```
+
+## Calculating the benchmark's performance
+```{r}
+dates <- Closing$date
+JALSH_returns <- JALSH %>% 
+  filter(date %in% dates) %>% 
+  mutate(JSE_log_ret = c(0,diff(log(PX_LAST)))) %>%
+  mutate(JSE_cum_ret = cumprod(1+JSE_log_ret))
+SWIX_returns <- SWIX %>%
+  filter(date %in% dates) %>%
+  mutate(SWIX_log_ret = c(0,diff(log(PX_LAST)))) %>%
+  mutate(SWIX_cum_ret = cumprod(1+SWIX_log_ret)) %>%
+  select(-PX_LAST)
+# There is actually one quarterly date missing in the SWIX data. Wont make difference to cumulative returns at the end.
+```
+
+
+## The total return for each period
+```{r}
+# The log returns for each asset on the JALSH for each 3 month period
+Quarter_logreturns <- close_prices$data[[2]] %>%
+  bind_rows(.id = "Ticker") %>%
+  group_by(Ticker) %>%
+  nest()
+
+log_returns2 <- function(df){
+close <- df$"PX_LAST"
+date <- dplyr::filter(df,date >= date[1]) %>% select(date)
+ret <- tibble(date = date$date, log_ret = c(0,diff(log(close))))
+}
+
+Quarter_logreturns <- Quarter_logreturns %>% mutate(logret = map(data,log_returns2))
+
+# leading the dates one period forward in order to get the return achieved over a 3 month period when mapping the Tot_return function
+dates <- Closing$date %>% lead()
+
+# This function mutates the corresponding return for an asset over the next 3 months with all the assets selected in the model.
+Tot_return <- function(df1,df2){
+  Tickers <- df1$Ticker
+  b <- Quarter_logreturns %>%
+    unnest(logret) %>%
+    filter(date == df2,Ticker %in% Tickers) %>%
+    right_join(df1,by="Ticker") %>%
+    mutate(RP_tot_ret = RP_Weight*log_ret, 
+           MC_tot_ret = MC_Weight*log_ret,
+           ERC_tot_ret = ERC_Weight*log_ret)
+}
+
+# Mapping the function and adding a new list : tot_ret to the closing tibble
+# The output, a tibble with all the slected stocks with their corresponding weights and 3 month log returns and total returns (weight*return)
+Closing <- Closing %>% 
+  mutate(tot_ret = map2(returns,dates,Tot_return))
+
+
+
+# get the total return for a 3 month period.
+#Mapping a sum_returns function over the total return list in the closing tibble
+RP_Ret <- Closing %>% 
+  mutate(RP_Ret = map_dbl(tot_ret,function(df) sum(df$RP_tot_ret)),
+         MC_Ret = map_dbl(tot_ret,function(df) sum(df$MC_tot_ret)),
+         ERC_Ret = map_dbl(tot_ret,function(df) sum(df$ERC_tot_ret))) %>% 
+  select(date,RP_Ret,MC_Ret,ERC_Ret)
+
+# adding the cumulative return tibble to the RP_Ret_MOM model
+RP_Ret_4FACTOR <- RP_Ret %>% 
+  mutate(RP_cum_ret = cumprod(RP_Ret+1) ,
+         MC_cum_ret = cumprod(MC_Ret+1),
+         ERC_cum_ret = cumprod(ERC_Ret+1)) %>%
+  dplyr::rename(Rebalancing_Date = date) %>%
+  mutate(date = lead(Rebalancing_Date))
+
+# This tibble gives a summary of the performance up to a specific date.
+
+# Adding the benchmark's performance.
+# In this case only the JSE All Share index is used, since it had data from before 2001.
+# If another benchmark need to be added, the starting date needs to be changed since I compare RP_Ret_VALUE returns
+RP_Ret_4FACTOR <- RP_Ret_4FACTOR %>% 
+  left_join(JALSH_returns,by = "date") %>% 
+  left_join(SWIX_returns,by = "date") %>%
+  select(-PX_LAST) %>% 
+  dplyr::rename(End_Date = date) %>%
+  filter(Rebalancing_Date < ymd("20160930"))
+
+  # Omitting the last row, which has no data due to the dates moving one period forward
+
+ggplot(RP_Ret_4FACTOR) + 
+  geom_line(aes(x=End_Date,y=RP_cum_ret,colour = "Risk Parity"),size =1) + 
+  geom_line(aes(x=End_Date,y=ERC_cum_ret,colour = "Equal Risk Contribution"),size =1) + 
+  geom_line(aes(x=End_Date,y=MC_cum_ret,colour = "Market Cap"),size =1) +
+  geom_line(aes(x=End_Date,y=SWIX_cum_ret,colour = "SWIX Performance"),size =1) + 
+  geom_line(aes(x=End_Date,y=JSE_cum_ret,colour = "JSE Performance"),size =1) + 
+  labs(x="Date",y= "Cumulative Return", title = "Cumulative returns for the various portfolios",subtitle = "4 Factor Fund based on cross secional comparison") +
+  scale_color_discrete(name = "Weighting Strategies")
+
+#relative performance
+portf <- RP_Ret_4FACTOR %>% na.omit() %>% select(End_Date,MC_Ret,ERC_Ret,RP_Ret)
+bench <- RP_Ret_4FACTOR %>% na.omit() %>% select(End_Date,SWIX_log_ret)
+rownames(portf) <- portf$End_Date
+rownames(bench) <- bench$End_Date
+portf <- portf %>% select(MC_Ret,ERC_Ret,RP_Ret) %>% as.xts()
+bench <- bench %>% select(SWIX_log_ret) %>% as.xts()
+chart.RelativePerformance(portf,bench,main = "Relative performance with respect to the swix",legend.loc = "topright")
+```
+
+Performance table
+```{r}
+new_portf <- RP_Ret_4FACTOR %>% 
+  filter(End_Date <= ymd(20161030)) %>% 
+  select(End_Date,RP_Ret,ERC_Ret,MC_Ret,JSE_log_ret,SWIX_log_ret)
+
+rownames(new_portf) <- new_portf$End_Date
+new_portf <- new_portf %>% select(RP_Ret:SWIX_log_ret)
+
+new_portf <- new_portf %>% as.xts()
+
+VaR(new_portf,p = 0.95,method = "gaussian")
+
+table.AnnualizedReturns(new_portf,Rf = 0.0675/4,scale = 4)
+table.DownsideRisk(new_portf,ci = 0.95,scale = 4,Rf = 0.0675/4,p = 0.95)
+
+InformationRatio(new_portf[,1:3],new_portf[,5],scale = 4)
+```
+
+## Combining the macro expsoure of the selected stocks with the tibble containing stock weights
+Make sure that the macroeconomic file was executed before the following chunks
+```{r}
+# A loop is run over all the rebalancing dates in the outer_combine function
+# In the inner map function, the macro exposures are combined with their corresponding shares for the specific date.
+outer_combine <- function(df,df1){
+  exposure <- exposure_per_reb_date_gruber %>% 
+    filter(dates == df) %>%
+    select(exposure)
+  df1 %>%
+    mutate(macro_exp = map(Ticker,function(df1){
+    ticker <- df1
+    model <- exposure$exposure[[1]] %>% filter(Ticker == ticker[[1]])
+    macroexp <- tibble(Alpha = model$model[[1]]$coefficients[["(Intercept)"]],
+                       ZAR = model$model[[1]]$coefficients[["ZAR_Change"]],
+                       OIL = model$model[[1]]$coefficients[["OIL"]],
+                       GOLD = model$model[[1]]$coefficients[["GOLD"]],
+                       SWAP = model$model[[1]]$coefficients[["SWAP"]])
+  }))
+}
+Macro <- Closing %>% 
+  mutate(macro_exp = map2(date,returns,outer_combine)) %>%
+  select(date,macro_exp)
+
+#The output can be compared to the specific model's output, to check if all the stocks are included and all their macro exposures are linked up
+Macro <- Macro %>% 
+  mutate(macro_exp = map(macro_exp,function(df) df %>% unnest(macro_exp)))
+
+```
+
+
+
+
+## Calculating the total macro exposure of the portfolio for a specific month
+```{r}
+Tot_macro <- function(df){
+  exp <- tibble(Alpha = df$RP_Weight*df$Alpha,
+                ZAR = df$RP_Weight*df$ZAR,
+                OIL = df$RP_Weight*df$OIL,
+                GOLD = df$RP_Weight*df$GOLD,
+                SWAP = df$RP_Weight*df$SWAP)
+  tot_exposure <- tibble(Alpha = sum(exp$Alpha),
+                         ZAR = sum(exp$ZAR),
+                         OIL = sum(exp$OIL),
+                         GOLD = sum(exp$GOLD),
+                         SWAP = sum(exp$SWAP))
+}
+Total_exposure <- Macro %>% mutate(tot_exp = map(macro_exp,Tot_macro))
+Total_exposure_4FACTOR_cross <- Total_exposure %>% unnest(tot_exp)
+
+p1 <- ggplot(Total_exposure_4FACTOR_cross) +
+  geom_line(aes(date,ZAR),colour = "green",size = 1)
+p2 <- ggplot(Total_exposure_4FACTOR_cross) +
+  geom_line(aes(date,OIL),size = 1)
+p3 <- ggplot(Total_exposure_4FACTOR_cross) +
+  geom_line(aes(date,GOLD),colour = "gold",size=1)
+p4 <- ggplot(Total_exposure_4FACTOR_cross) +
+  geom_line(aes(date,SWAP),colour = "blue",size=1)
+grid.arrange(p1,p2,p3,p4,top = textGrob("Macro exposure for the Quality fund based on cross sectional comparison"))
+```
+
+## Calculating daily performance of the portfolio
+```{r}
+# The daily performance of the portfolio is calculated in order to compute VaR and other risk measures at portfolio level
+Closing <- Closing %>% filter(date < Closing$date[[59]])
+
+dates <- Closing$date
+combine_daily_returns <- function(df1,df2){
+  Tickers <- df1$Ticker
+  logreturns %>%
+    unnest(logret) %>%
+    filter(date <= df1$date[[1]],date > df2) %>%
+    filter(Ticker %in% Tickers) %>%
+    group_by(Ticker) %>%
+    nest()
+}
+
+daily_performance <- Closing %>% 
+  mutate(d_performance = map2(tot_ret,dates,combine_daily_returns))
+
+Closing <- Closing %>%
+  mutate(d_performance = map2(Closing$tot_ret,daily_performance$d_performance,function(df1,df2){
+  left_join(df1,df2,by="Ticker")
+}))
+
+
+  
+daily_performance <- Closing %>% mutate(D_performance = map(d_performance, function(df){
+  df %>% 
+    select(Ticker,Market.Cap,RP_Weight,MC_Weight,ERC_Weight,data.y) %>%
+    unnest(data.y) %>%
+    mutate(RP_daily_ret = RP_Weight*log_ret, MC_daily_ret = MC_Weight*log_ret, ERC_daily_ret = ERC_Weight*log_ret) %>%
+    group_by(date) %>% 
+    nest() %>%
+    dplyr::rename(end_date=date)
+}))
+
+
+tot_daily_performance <- function(df2){
+  df2 %>% mutate(daily_portfolio_return = map(data,function(df1){
+  tibble(RP_tot_daily_ret = sum(df1$RP_daily_ret,na.rm=T),
+         MC_tot_daily_ret = sum(df1$MC_daily_ret,na.rm=T),
+         ERC_tot_daily_ret = sum(df1$ERC_daily_ret,na.rm=T))
+  }
+  ))
+}
+
+daily_performance <- daily_performance %>% 
+  mutate(daily_portfolio = map(D_performance,tot_daily_performance)) %>%
+  select(date,daily_portfolio)
+  
+daily_performance <- daily_performance %>%
+  mutate(daily_performance=map(daily_portfolio,function(df){
+  df %>% unnest(daily_portfolio_return)
+}))
+
+daily_performance_4FACTOR_Cross <- daily_performance %>% 
+  unnest(daily_performance)
+
+bench_returns <- function(df){
+  date <- dplyr::filter(df,date>date[1]) %>% select(date)
+  close <- df$PX_LAST
+  ret <- tibble(end_date = date$date, swix_daily_ret = diff(log(close)))
+}
+
+SWIX1 <- SWIX %>% bench_returns()
+JALSH1 <- JALSH %>% 
+  bench_returns() %>%
+  dplyr::rename(JALSH_daily_ret = swix_daily_ret)
+
+daily_performance_4FACTOR_Cross <- daily_performance_4FACTOR_Cross %>%
+  left_join(SWIX1) %>%
+  left_join(JALSH1)
+```
+
+## Comparing portfolio performances
+```{r}
+dates <- daily_performance_4FACTOR_Cross %>% filter(end_date %in% date) %>% select(end_date)
+
+drawdowns <- function(df1){
+  new <- daily_performance_4FACTOR_Cross %>%
+    filter(end_date <= df1,end_date >= df1 - years(1)) %>%
+    select(c(RP_tot_daily_ret,MC_tot_daily_ret,ERC_tot_daily_ret,swix_daily_ret,JALSH_daily_ret))
+  tibble(RP_Drawdown = new$RP_tot_daily_ret %>% maxDrawdown(na.rm=T),
+         ERC_Drawdown = new$ERC_tot_daily_ret %>% maxDrawdown(na.rm=T),
+         MC_Drawdown = new$MC_tot_daily_ret %>% maxDrawdown(na.rm=T),
+         SWIX_Drawdown = new$swix_daily_ret %>% maxDrawdown(na.rm=T),
+         JALSH_Drawdown = new$JALSH_daily_ret %>% maxDrawdown(na.rm=T))
+}
+
+DrawdownRecovery <- function(df){
+  new <- daily_performance_4FACTOR_Cross %>%
+    filter(end_date <= df, end_date >= df - years(1)) %>%
+    select(c(end_date,RP_tot_daily_ret:JALSH_daily_ret))
+  rownames(new) = new$end_date
+  new <- new %>% select(RP_tot_daily_ret:JALSH_daily_ret) %>% as.xts() %>% AverageRecovery()
+  tibble(RP_DrawdownDuration = new[[1]],
+         ERC_DrawdownDuration = new[[2]],
+         MC_DrawdownDuration = new[[3]],
+         SWIX_DrawdownDuration = new[[4]],
+         JALSH_DrawdownDuration = new[[5]])
+}
+
+drawdowns_4FACTOR_cross <- dates %>%
+  mutate(DD = map(end_date,drawdowns)) %>% 
+  unnest(DD)
+
+drawdownDurations_4FACTOR_cross <- dates %>%
+  mutate(DD = map(end_date,DrawdownRecovery)) %>% 
+  unnest(DD)
+
+p1 <- ggplot(drawdowns_4FACTOR_cross) +
+  geom_line(aes(x=end_date,y=RP_Drawdown, colour = "Risk Parity"),size=1) +
+  geom_line(aes(x=end_date,y=SWIX_Drawdown,colour="SWIX"),size=1) +
+  geom_line(aes(x=end_date,y=ERC_Drawdown,colour="ERC"),size=1) +
+  geom_line(aes(x=end_date,y=MC_Drawdown,colour="Market Cap"),size=1) +
+  geom_line(aes(x=end_date,y=JALSH_Drawdown,colour="JALSH"),size=1) +
+  labs(x="Date",y= "Maximum Drawdown", title = "Maximum Drawdowns for the various portfolios",subtitle = "4FACTOR Fund based on time series comparison") +
+  scale_color_discrete(name = "Weighting Strategies")
+
+p2 <- ggplot(drawdownDurations_4FACTOR_cross) +
+  geom_line(aes(x=end_date,y=RP_DrawdownDuration, colour = "Risk Parity"),size=1) +
+  geom_line(aes(x=end_date,y=SWIX_DrawdownDuration,colour="SWIX"),size=1) +
+  geom_line(aes(x=end_date,y=ERC_DrawdownDuration,colour="ERC"),size=1) +
+  geom_line(aes(x=end_date,y=MC_DrawdownDuration,colour="Market Cap"),size=1) +
+  geom_line(aes(x=end_date,y=JALSH_DrawdownDuration,colour="JALSH"),size=1) +
+  labs(x="Date",y= "Maximum Drawdown", title = "Drawdown durations for the various portfolios",subtitle = "4FACTOR Fund based on cross sectional comparison") +
+  scale_color_discrete(name = "Weighting Strategies")
+
+grid.arrange(p1,p2,nrow =2)
+
+varestimates <- function(df1,df2){
+  new <- daily_performance_4FACTOR_Cross %>%
+    filter(end_date <= df1,end_date >= df1 - years(1)) %>%
+    select(c(RP_tot_daily_ret,MC_tot_daily_ret,ERC_tot_daily_ret,swix_daily_ret,JALSH_daily_ret))
+  tibble(RP_VaR = new$RP_tot_daily_ret %>% VaR(p=.95,method = df2) %>% as.double(),
+         ERC_VaR = new$ERC_tot_daily_ret %>% VaR(p=.95,method = df2)%>% as.double(),
+         MC_VaR = new$MC_tot_daily_ret %>% VaR(p=.95,method = df2) %>% as.double(),
+         SWIX_VaR = new$swix_daily_ret %>% VaR(p=.95,method = df2) %>% as.double(),
+         JALSH_VaR = new$JALSH_daily_ret %>% VaR(p=.95,method = df2) %>% as.double())
+}
+VaR_4FACTOR_cross_hist <- dates %>%
+  mutate(daily_VaR = map2(end_date,"historical",varestimates)) %>%
+  unnest(daily_VaR)
+
+VaR_4FACTOR_cross_gaus <- dates %>%
+  mutate(daily_VaR = map2(end_date,"gaussian",varestimates)) %>%
+  unnest(daily_VaR)
+
+VaR_4FACTOR_cross_mod <- dates %>%
+  mutate(daily_VaR = map2(end_date,"modified",varestimates)) %>%
+  unnest(daily_VaR)
+
+p1 <- ggplot(VaR_4FACTOR_cross_hist) +
+  geom_line(aes(x=end_date,y=RP_VaR, colour = "Risk Parity"),size=1) +
+  geom_line(aes(x=end_date,y=SWIX_VaR,colour="SWIX"),size=1) +
+  geom_line(aes(x=end_date,y=ERC_VaR,colour="ERC"),size=1) +
+  geom_line(aes(x=end_date,y=MC_VaR,colour="Market Cap"),size=1) +
+  geom_line(aes(x=end_date,y=JALSH_VaR,colour="JALSH"),size=1) +
+  labs(x="Date",y= "Daily VaR", title = "Daily historical VaR estimates for the various portfolios",subtitle = "Value Fund based on cross sectional comparison") +
+  scale_color_discrete(name = "Weighting Strategies")
+
+p2 <- ggplot(VaR_4FACTOR_cross_gaus) +
+  geom_line(aes(x=end_date,y=RP_VaR, colour = "Risk Parity"),size=1) +
+  geom_line(aes(x=end_date,y=SWIX_VaR,colour="SWIX"),size=1) +
+  geom_line(aes(x=end_date,y=ERC_VaR,colour="ERC"),size=1) +
+  geom_line(aes(x=end_date,y=MC_VaR,colour="Market Cap"),size=1) +
+  geom_line(aes(x=end_date,y=JALSH_VaR,colour="JALSH"),size=1) +
+  labs(x="Date",y= "Daily VaR", title = "Daily Normal linear VaR estimates for the various portfolios",subtitle = "Value Fund based on cross sectional comparison") +
+  scale_color_discrete(name = "Weighting Strategies")
+
+p3 <- ggplot(VaR_4FACTOR_cross_mod) +
+  geom_line(aes(x=end_date,y=RP_VaR, colour = "Risk Parity"),size=1) +
+  geom_line(aes(x=end_date,y=SWIX_VaR,colour="SWIX"),size=1) +
+  geom_line(aes(x=end_date,y=ERC_VaR,colour="ERC"),size=1) +
+  geom_line(aes(x=end_date,y=MC_VaR,colour="Market Cap"),size=1) +
+  geom_line(aes(x=end_date,y=JALSH_VaR,colour="JALSH"),size=1) +
+  labs(x="Date",y= "Daily VaR", title = "Daily Monte Carlo VaR estimates for the various portfolios",subtitle = "Value Fund based on cross sectional comparison") +
+  scale_color_discrete(name = "Weighting Strategies")
+
+grid.arrange(p1,p2,p3)
+
+SharpeRatioEstimates <- function(df){
+  new <- daily_performance_4FACTOR_Cross %>%
+    filter(end_date <= df,end_date >= df - years(1)) %>%
+    select(c(RP_tot_daily_ret,MC_tot_daily_ret,ERC_tot_daily_ret,swix_daily_ret,JALSH_daily_ret))
+  tibble(RP_SR = (mean(new$RP_tot_daily_ret,na.rm = T) - 0.09/252)/sd(new$RP_tot_daily_ret,na.rm = T),
+         ERC_SR = (mean(new$ERC_tot_daily_ret,na.rm = T) - 0.09/252)/sd(new$ERC_tot_daily_ret,na.rm = T),
+         MC_SR = (mean(new$MC_tot_daily_ret,na.rm = T) - 0.09/252)/sd(new$MC_tot_daily_ret,na.rm = T),
+         SWIX_SR = (mean(new$swix_daily_ret,na.rm = T) - 0.09/252)/sd(new$swix_daily_ret,na.rm = T),
+         JALSH_SR = (mean(new$JALSH_daily_ret,na.rm = T) - 0.09/252)/sd(new$JALSH_daily_ret,na.rm = T))
+}
+
+IR <- function(df){
+  new <- daily_performance_4FACTOR_Cross %>%
+    filter(end_date <= df, end_date >= df - years(1)) %>%
+    select(end_date,RP_tot_daily_ret:ERC_tot_daily_ret,JALSH_daily_ret)
+  new2 <- daily_performance_4FACTOR_Cross %>%
+    filter(end_date <= df, end_date >= df - years(1)) %>%
+    select(end_date,swix_daily_ret)
+  rownames(new) <- new$end_date
+  rownames(new2) <- new2$end_date
+  new <- new %>% select(RP_tot_daily_ret:ERC_tot_daily_ret,JALSH_daily_ret) %>% as.xts()
+  new2 <- new2 %>% select(swix_daily_ret) %>% as.xts()
+  IRs <- InformationRatio(new,new2,scale = 4)
+  tibble(RP_IR = IRs[[1]],
+         MC_IR = IRs[[2]],
+         ERC_IR = IRs[[3]],
+         JALSH_IR = IRs[[4]])
+}
+
+IR_4FACTOR_cross <- dates %>%
+  mutate(Q_IR = map(end_date,IR)) %>%
+  unnest(Q_IR)
+
+SharpeRatio_4FACTOR_cross <- dates %>%
+  mutate(daily_SR = map(end_date,SharpeRatioEstimates)) %>%
+  unnest(daily_SR)
+
+p1 <- ggplot(SharpeRatio_4FACTOR_cross) +
+  geom_line(aes(x=end_date,y=RP_SR, colour = "Risk Parity"),size=1) +
+  geom_line(aes(x=end_date,y=SWIX_SR,colour="SWIX"),size=1) +
+  geom_line(aes(x=end_date,y=ERC_SR,colour="ERC"),size=1) +
+  geom_line(aes(x=end_date,y=MC_SR,colour="Market Cap"),size=1) +
+  geom_line(aes(x=end_date,y=JALSH_SR,colour="JALSH"),size=1) +
+  labs(x="Date",y= "Daily Sharpe Ratio", title = "Daily Sharpe Ratio estimates for the various portfolios",subtitle = "Value Fund based on time series comparison") +
+  scale_color_discrete(name = "Weighting Strategies")
+
+p2 <- ggplot(IR_4FACTOR_cross) +
+  geom_line(aes(x=end_date,y=RP_IR, colour = "Risk Parity"),size=1) +
+  geom_line(aes(x=end_date,y=JALSH_IR,colour="JALSH"),size=1) +
+  geom_line(aes(x=end_date,y=ERC_IR,colour="ERC"),size=1) +
+  geom_line(aes(x=end_date,y=MC_IR,colour="Market Cap"),size=1) +
+  labs(x="Date",y= "Quarterly Information ratio", title = "Quarterly Information ratio estimates for the various portfolios",subtitle = "4FACTOR Fund based on cross sectional comparison") +
+  scale_color_discrete(name = "Weighting Strategies")
+
+grid.arrange(p1,p2)
+```
